@@ -1,17 +1,17 @@
-# fastapi_app.py
 import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import aiohttp
-from typing import Literal, Any
+from typing import List, Dict, AsyncGenerator
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-import re
 import asyncio
 from dotenv import load_dotenv
 import os
+from fastapi.responses import StreamingResponse
+import json
 
 # Настройки базы данных
 DATABASE_URL = "postgresql+psycopg2://postgres:artas@localhost/uproject-users"
@@ -21,7 +21,6 @@ Base = declarative_base()
 
 load_dotenv()
 LOLZTOKEN = os.getenv("LOLZTOKEN")
-print(LOLZTOKEN)
 
 # Создаем экземпляр FastAPI
 app = FastAPI()
@@ -73,13 +72,13 @@ def create_user(user: UserCreate):
 
 # Модель для обработки ссылок
 class LinksRequest(BaseModel):
-    links: list[str]
+    links: List[str]
 
 # Функция для получения информации по товару
 async def get_item_info(item_id, item_type="default"):
     base_url = "https://api.zelenka.guru/market"
     url = f"{base_url}/{item_id}?oauth_token={LOLZTOKEN}"
-    
+
     if item_type == "special":
         url = f"{base_url}/{item_id}/special?oauth_token={LOLZTOKEN}"
     
@@ -87,6 +86,7 @@ async def get_item_info(item_id, item_type="default"):
         try:
             async with session.get(url) as response:
                 if response.status == 200:
+                    print("Успех 200")
                     item_info = await response.json()
                     item_info = item_info["item"]
                     price = item_info["price"]
@@ -98,8 +98,7 @@ async def get_item_info(item_id, item_type="default"):
                     elif item_state == "active":
                         return price, item_state
                 elif response.status == 429:
-                    print(f"2 секунды")
-                    await asyncio.sleep(2)  # Задержка на 2 секунды
+                    await asyncio.sleep(3)  # Задержка на 3 секунды
                     return await get_item_info(item_id, item_type)  # Повторить запрос
                 else:
                     print(f"Failed request with status: {response.status}")
@@ -108,45 +107,55 @@ async def get_item_info(item_id, item_type="default"):
             print(f"Error occurred: {e}")
             return None
 
-# Эндпоинт: Обработка ссылок
 @app.post("/process-links")
-async def process_links(request: LinksRequest):
-    links = request.links
-    result = ""
+async def process_links_endpoint(request: LinksRequest):
+    async def stream_links():
+        links = request.links
+        total_links = len(links)
+        filtered_results = []
+        total_green_price = 0
+        progress_counter = 1
 
-    for link in links:
-        item_id = ''.join(filter(str.isdigit, link))
-        item_info = await get_item_info(item_id)
+        for link in links:
+            item_id = ''.join(filter(str.isdigit, link))
+            item_info = await get_item_info(item_id)
 
-        if item_info:
-            # Если item_info возвращает меньше 3 значений, присваиваем значения по умолчанию
-            if len(item_info) == 3:
-                original_price, grnt_active, item_state = item_info
-            elif len(item_info) == 2:
-                original_price, item_state = item_info
+
+            result = {}
+            if item_info:
+                if len(item_info) == 3:
+                    original_price, grnt_active, item_state = item_info
+                elif len(item_info) == 2:
+                    original_price, item_state = item_info
+                else:
+                    result += f"Ошибка обработки аккаунта: {link}\n"
+                    progress_counter += 1
+                    yield json.dumps(result) + "\n"
+                    continue
+
+                discounted_price = round(float(original_price) * 0.97)
+
+                if item_state == "paid":
+                    item_state = "🟢"  # Зеленый аккаунт
+                    if grnt_active:
+                        item_state = "🟡"  # Желтый аккаунт
+                    if not grnt_active:
+                        total_green_price += discounted_price
+                elif item_state == "active":
+                    item_state = "🔴"  # Красный аккаунт
+
+                filtered_results.append({"link": link, "state": item_state, "price": discounted_price})
+                result["message"] = f"{link} - {item_state} - Цена: {discounted_price}"
+                result["total_green_price"] = total_green_price
+                result["filtered_results"] = filtered_results
+                result["progress"] = f"Проверено {progress_counter} из {total_links}"
             else:
-                result += f"Ошибка обработки аккаунта: {link}\n"
-                print(f"Неожиданный формат данных для ссылки: {link}")
-                continue
+                result["progress"] = f"Проверено {progress_counter} из {total_links}"
+                result["message"] = f" - Удалено/Нет доступа {link}"
+                result["filtered_results"] = filtered_results
+                filtered_results.append({"link": link, "state": "🗑️", "price": 0})
 
-            discounted_price = round(float(original_price) * 0.97)
+            progress_counter += 1
+            yield json.dumps(result) + "\n"
 
-            # Преобразуем состояние в текст
-            if item_state == "paid":
-                item_state = "🟢"
-                if grnt_active:  # Проверяем активность гарантии
-                    item_state = "🟡"
-            if item_state == "active":
-                item_state = "🔴"
-            result += f"Аккаунт: {link} - Состояние: {item_state}, Цена: {discounted_price}\n"
-        else:
-            result += f"Удалено/Нет доступа: {link}\n"
-            print(f"Удалено/Нет доступа: {link}")  # Логируем ошибку
-
-    return {"message": result}
-
-
-# Запуск FastAPI сервера
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return StreamingResponse(stream_links(), media_type="application/json")
